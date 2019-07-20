@@ -19,6 +19,7 @@
 let Module = null;
 
 const logln = p => host.diagnostics.debugLog(p + '\n');
+const hex = p => '0x' + p.toString(16).padStart(16, '0');
 const JSVAL_TAG_SHIFT = host.Int64(47);
 const JSVAL_PAYLOAD_MASK = host.Int64(1).bitwiseShiftLeft(JSVAL_TAG_SHIFT).subtract(1);
 const CLASS_NON_NATIVE = host.Int64(0x40000);
@@ -371,6 +372,7 @@ class __JSArray {
         this._Header = heapslot_to_objectelements(this._Content);
         this._Length = this._Header.length;
         this._Capacity = this._Header.capacity;
+        this._InitializedLength = this._Header.initializedLength;
     }
 
     get Length() {
@@ -381,10 +383,14 @@ class __JSArray {
         return this._Capacity;
     }
 
+    get InitializedLength() {
+        return this._InitializedLength;
+    }
+
     toString() {
         const Max = 10;
         const Content = [];
-        for(let Idx = 0; Idx < Math.min(Max, this.Length); ++Idx) {
+        for(let Idx = 0; Idx < Math.min(Max, this._InitializedLength); ++Idx) {
             const Addr = this._Content.add(Idx * 8);
             const JSValue = read_u64(Addr);
             const Inst = jsvalue_to_instance(JSValue);
@@ -399,9 +405,10 @@ class __JSArray {
     }
 
     Display() {
-        this.Logger('  Length: ' + this.Length);
-        this.Logger('Capacity: ' + this.Capacity);
-        this.Logger(' Content: ' + this);
+        this.Logger('           Length: ' + this.Length);
+        this.Logger('         Capacity: ' + this.Capacity);
+        this.Logger('InitializedLength: ' + this.InitializedLength);
+        this.Logger('          Content: ' + this);
     }
 }
 
@@ -699,6 +706,7 @@ const Names2Types = {
     'Undefined' : __JSUndefined,
     'Symbol' : __JSSymbol,
     'Double' : __JSDouble,
+    'Magic' : __JSMagic,
 
     'Float64Array' : __JSTypedArray,
     'Float32Array' : __JSTypedArray,
@@ -866,7 +874,7 @@ class __JSObject {
 Names2Types['Object'] = __JSObject;
 
 function smdump_jsobject(Addr, Type = null) {
-    Init();
+    init();
 
     if(Addr.hasOwnProperty('address')) {
         Addr = Addr.address;
@@ -890,7 +898,7 @@ function smdump_jsobject(Addr, Type = null) {
 }
 
 function smdump_jsvalue(Addr) {
-    Init();
+    init();
 
     if(Addr == undefined) {
         logln('!smdump_jsvalue <jsvalue object addr>');
@@ -913,7 +921,7 @@ function smdump_jsvalue(Addr) {
     return smdump_jsobject(JSValue.Payload, Name);
 }
 
-function Init() {
+function init() {
     if(Module != null) {
         return;
     }
@@ -931,15 +939,158 @@ function Init() {
     Module = 'js.exe';
 }
 
+function ion_insertbp() {
+    // XXX: Having the current frame would be better.. but not sure if
+    // this is something possible?
+    const CurrentThread = host.currentThread;
+    const LowestFrame = CurrentThread.Stack.Frames[0];
+    const LocalVariables = LowestFrame.LocalVariables;
+    const CodeGenerator = LocalVariables.this;
+    if(CodeGenerator === undefined ||
+       CodeGenerator.targetType.toString() != 'js::jit::CodeGenerator *') {
+        logln('The script expects `this` to be a js::jit::CodeGenerator in the lowest frame.');
+        return;
+    }
+
+    const JITBuffer = CodeGenerator.masm.masm.m_formatter.m_buffer.m_buffer;
+    // XXX: So sounds like I can't do JITBuffer.mBegin[JITBuffer.mLength] = 0xcc,
+    // so here I am writing ugly things :x
+    const BreakpointAddress = JITBuffer.mBegin.address.add(JITBuffer.mLength);
+    logln(`JIT buffer is at ${hex(JITBuffer.mBegin.address)}`);
+    logln(`Writing breakpoint at ${hex(BreakpointAddress)}`);
+    host.evaluateExpression(`*(char*)${hex(BreakpointAddress)} = 0xcc`);
+    JITBuffer.mLength += 1;
+}
+
+let Context = undefined;
+function dump_nursery_stats(Nursery) {
+    logln(`${hex(Nursery.address)}: js::Nursery`);
+    const ChunkCountLimit = Nursery.chunkCountLimit_;
+    const NurseryChunk = host.createPointerObject(
+        0,
+        Module,
+        'js::NurseryChunk*'
+    );
+    const ChunkSize = NurseryChunk.dereference().targetType.size;
+    const MaxSize = ChunkCountLimit.multiply(ChunkSize);
+    logln(` ChunkCountLimit: ${hex(ChunkCountLimit)} (${MaxSize / 1024 / 1024} MB)`);
+    const Capacity = Nursery.capacity_;
+    logln(`        Capacity: ${hex(Capacity)} bytes`)
+    const CurrentChunk = Nursery.currentStartPosition_;
+    logln(`    CurrentChunk: ${hex(CurrentChunk)}`);
+    const Position = Nursery.position_;
+    logln(`        Position: ${hex(Position)}`);
+    logln('          Chunks:');
+    const Chunks = Nursery.chunks_;
+    for(let Idx = 0; Idx < Chunks.mLength; Idx++) {
+        const Chunk = Chunks.mBegin[Idx];
+        const StartAddress = Chunk.data.address;
+        const EndAddress = StartAddress.add(ChunkSize).subtract(1);
+        const PaddedIdx = Idx.toString().padStart(2, '0');
+        logln(`            ${PaddedIdx}: [${hex(StartAddress)} - ${hex(EndAddress)}]`);
+    }
+}
+
+function in_nursery(Addr) {
+    init();
+
+    if(Addr == undefined) {
+        logln('!in_nursery <object addr>');
+        return;
+    }
+
+    //
+    // Find 'cx' the JSContext somewhere..
+    //
+
+    if(Context == undefined) {
+        const CurrentThread = host.currentThread;
+        for(const Frame of CurrentThread.Stack.Frames) {
+            const Parameters = Frame.Parameters;
+            if(Parameters == undefined) {
+                continue;
+            }
+
+            Context = Parameters.cx;
+            if(Context == undefined ||
+            Context.targetType.toString() != 'JSContext *') {
+                continue;
+            }
+
+            logln(`Caching JSContext @${hex(Context.address)} for next times.`);
+            break;
+        }
+    } else {
+        logln(`Using previously cached JSContext @${hex(Context.address)}`);
+    }
+
+    if(Context == undefined) {
+        logln('Could not locate a JSContext in this call-stack.');
+        return;
+    }
+
+    //
+    // Get the Nursery.
+    //
+
+    const Nursery = Context.runtime_.value.gc.nursery_.value;
+    const NurseryChunk = host.createPointerObject(
+        0,
+        Module,
+        'js::NurseryChunk*'
+    );
+    const ChunkUseableSize = NurseryChunk.data.targetType.size;
+
+    //
+    // Dump some stats about the Nursery.
+    //
+
+    dump_nursery_stats(Nursery);
+    logln('-------');
+
+    //
+    // Iterate through the chunk regions.
+    //
+
+    const Chunks = Nursery.chunks_;
+    let FoundChunk = undefined;
+    for(let Idx = 0; Idx < Chunks.mLength; Idx++) {
+        const Chunk = Chunks.mBegin[Idx];
+        const StartAddress = Chunk.data.address;
+        const EndAddress = StartAddress.add(ChunkUseableSize);
+        if(Addr.compareTo(StartAddress) >= 0 &&
+           Addr.compareTo(EndAddress) < 0) {
+               FoundChunk = Chunk;
+               break;
+           }
+    }
+
+    if(FoundChunk != undefined) {
+        logln(`${hex(Addr)} has been found in the js::NurseryChunk @${hex(FoundChunk.data.address)}!`);
+        return;
+    }
+
+    logln(`${hex(Addr)} hasn't been found be in any Nursery js::NurseryChunk.`);
+}
+
 function initializeScript() {
     return [
-        new host.apiVersionSupport(1, 2),
+        new host.apiVersionSupport(1, 3),
         new host.functionAlias(
             smdump_jsvalue,
             'smdump_jsvalue'
-        ), new host.functionAlias(
+        ),
+        new host.functionAlias(
             smdump_jsobject,
             'smdump_jsobject'
+        ),
+        new host.functionAlias(
+            ion_insertbp,
+            'ion_insertbp'
+        ),
+        new host.functionAlias(
+            in_nursery,
+            'in_nursery'
         )
     ];
 }

@@ -57,6 +57,27 @@
                             </Description>
                         </AliasItem>
                     </FunctionAlias>
+                    <FunctionAlias Name='ion_insertbp'>
+                        <AliasItem>
+                            <Syntax>
+                                <![CDATA[!ion_insertbp]]>
+                            </Syntax>
+                            <Description>
+                                <![CDATA[Insert an int3 in the assembly buffer to debug JIT'd code.]]>
+                            </Description>
+                        </AliasItem>
+                    </FunctionAlias>
+                    <FunctionAlias Name='in_nursery'>
+                        <AliasItem>
+                            <Syntax>
+                                <![CDATA[!in_nursery]]>
+                            </Syntax>
+                            <Description>
+                                <![CDATA[Figure out if an object is stored in the Nursery or not.]]>
+                            </Description>
+                        </AliasItem>
+                    </FunctionAlias>
+
                 </FunctionAliases>
             </ScriptComponent>
         </Components>
