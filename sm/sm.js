@@ -195,6 +195,70 @@ class __JSMagic {
     }
 }
 
+class __JSArgument {
+    //  * ArgumentsObject instances use the following reserved slots:
+    //  *
+    //  *   INITIAL_LENGTH_SLOT
+    //  *     Stores the initial value of arguments.length, plus a bit indicating
+    //  *     whether arguments.length and/or arguments[@@iterator] have been
+    //  *     modified.  Use initialLength(), hasOverriddenLength(), and
+    //  *     hasOverriddenIterator() to access these values.  If arguments.length has
+    //  *     been modified, then the current value of arguments.length is stored in
+    //  *     another slot associated with a new property.
+    //  *   DATA_SLOT
+    //  *     Stores an ArgumentsData*, described above.
+    //  *   MAYBE_CALL_SLOT
+    //  *     Stores the CallObject, if the callee has aliased bindings. See
+    //  *     the ArgumentsData::args comment.
+    //  *   CALLEE_SLOT
+    //  *     Stores the initial arguments.callee. This value can be overridden on
+    //  *     mapped arguments objects, see hasOverriddenCallee.
+    //  */
+    // class ArgumentsObject : public NativeObject {
+    //     protected:
+    //      static const uint32_t INITIAL_LENGTH_SLOT = 0;
+    //      static const uint32_t DATA_SLOT = 1;
+    //      static const uint32_t MAYBE_CALL_SLOT = 2;
+    //      static const uint32_t CALLEE_SLOT = 3;
+    constructor(Addr) {
+        this._Addr = Addr;
+        this._Obj = host.createPointerObject(
+            Addr,
+            Module,
+            'js::ArgumentsObject*'
+        );
+
+        const INITIAL_LENGTH_SLOT = host.Int64(0);
+        const DATA_SLOT = host.Int64(1);
+        const MAYBE_CALL_SLOT = host.Int64(2);
+        const CALLEE_SLOT = host.Int64(3);
+        const ArgumentsObjectSize = this._Obj.dereference().targetType.size;
+        this._SlotAddress = this._Obj.address.add(ArgumentsObjectSize);
+
+        const InitialLengthSlot = read_u64(this._SlotAddress.add(
+            INITIAL_LENGTH_SLOT.multiply(8)
+        ));
+        this._InitialLength = new __JSInt32(InitialLengthSlot)._Value;
+
+        this._Data = read_u64(this._SlotAddress.add(
+            DATA_SLOT.multiply(8)
+        )).bitwiseShiftLeft(1);
+    }
+
+    toString() {
+        return 'Arguments(..)';
+    }
+
+    Logger(Content) {
+        logln(this._Addr.toString(16) + ': js!js::ArgumentsObject: ' + Content);
+    }
+
+    Display() {
+        this.Logger('InitialLength: ' + this._InitialLength);
+        this.Logger('         Data: ' + hex(this._Data) + ' (js!js::ArgumentsData)');
+    }
+}
+
 class __JSNull {
     constructor(Addr) {
         this._Addr = Addr;
@@ -370,21 +434,15 @@ class __JSArray {
         // this.Obj.elements_.value.address
         this._Content = this._Obj.elements_.address;
         this._Header = heapslot_to_objectelements(this._Content);
+        // The flags word stores both the flags and the number of shifted elements.
+        // Allow shifting 2047 elements before actually moving the elements.
+        const NumShiftedElementsBits = host.Int64(11);
+        const NumShiftedElementsShift = host.Int64(32).subtract(NumShiftedElementsBits);
+        this._Flags = this._Header.flags;
+        this._NumShifted = this._Flags.bitwiseShiftRight(NumShiftedElementsShift)
         this._Length = this._Header.length;
         this._Capacity = this._Header.capacity;
         this._InitializedLength = this._Header.initializedLength;
-    }
-
-    get Length() {
-        return this._Length;
-    }
-
-    get Capacity() {
-        return this._Capacity;
-    }
-
-    get InitializedLength() {
-        return this._InitializedLength;
     }
 
     toString() {
@@ -397,7 +455,7 @@ class __JSArray {
             Content.push(Inst.toString());
         }
 
-        return '[' + Content.join(', ') + (this.Length > Max ? ', ...' : '') + ']';
+        return '[' + Content.join(', ') + (this._Length > Max ? ', ...' : '') + ']';
     }
 
     Logger(Content) {
@@ -405,9 +463,10 @@ class __JSArray {
     }
 
     Display() {
-        this.Logger('           Length: ' + this.Length);
-        this.Logger('         Capacity: ' + this.Capacity);
-        this.Logger('InitializedLength: ' + this.InitializedLength);
+        this.Logger('           Length: ' + this._Length);
+        this.Logger('         Capacity: ' + this._Capacity);
+        this.Logger('InitializedLength: ' + this._InitializedLength);
+        this.Logger('       NumShifted: ' + this._NumShifted + ' (flags: ' + hex(this._Flags) + ')');
         this.Logger('          Content: ' + this);
     }
 }
@@ -707,6 +766,7 @@ const Names2Types = {
     'Symbol' : __JSSymbol,
     'Double' : __JSDouble,
     'Magic' : __JSMagic,
+    'Arguments' : __JSArgument,
 
     'Float64Array' : __JSTypedArray,
     'Float32Array' : __JSTypedArray,

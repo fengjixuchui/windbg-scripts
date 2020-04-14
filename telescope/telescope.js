@@ -15,6 +15,9 @@ const DefaultNumberOfLines = 10;
 // This is the number of instructions to disassemble when a code pointer is encountered.
 const DefaultNumberOfInstructions = 3;
 
+// This is the maximum number of characters displayed for strings in the !telescope output.
+const DefaultMaxStringLength = 15;
+
 //
 // Utility functions.
 //
@@ -109,6 +112,14 @@ function FormatU64(Addr) {
 
 function FormatU32(Addr) {
     return '0x' + Addr.toString(16).padStart(8, '0');
+}
+
+function FormatString(Str) {
+    if(Str.length > DefaultMaxStringLength) {
+        return Str.substr(0, DefaultMaxStringLength) + '...'
+    }
+
+    return Str;
 }
 
 function BitSet(Value, Bit) {
@@ -330,6 +341,23 @@ function HandleUser() {
         //
         // TEB!
         //
+        // In the case where you have broken `ntdll` symbols, you might not have
+        // the definition of the `_TEB` structure. In this case, the structured
+        // `Teb` object above is undefined (like in issues #2). So we try to be resilient
+        // against that in the below.
+        //
+
+        if(Teb == undefined) {
+            const General = host.namespace.Debugger.State.PseudoRegisters.General;
+            VaSpace.push(new _Region(
+                General.teb.address,
+                0x100,
+                'Teb of ' + Thread.Id.toString(16),
+                'rw-'
+            ));
+
+            continue;
+        }
 
         VaSpace.push(new _Region(
             Teb.address,
@@ -353,17 +381,31 @@ function HandleUser() {
     }
 
     //
-    // Get the PEB.
+    // Get the PEB. Keep in mind we can run into the same symbol problem with the
+    // PEB - so account for that.
     //
 
     logln('Populating the VA space with the PEB..');
     const Peb = CurrentProcess.Environment.EnvironmentBlock;
-    VaSpace.push(new _Region(
-        Peb.address,
-        Peb.targetType.size,
-        'Peb',
-        'rw-'
-    ));
+
+    if(Peb == undefined) {
+        const General = host.namespace.Debugger.State.PseudoRegisters.General;
+        VaSpace.push(new _Region(
+            General.peb.address,
+            0x1000,
+            'Peb',
+            'rw-'
+        ));
+
+        logln(`/!\\ Several regions have been skipped because nt!_TEB / nt!_PEB aren't available in your symbols.`);
+    } else {
+        VaSpace.push(new _Region(
+            Peb.address,
+            Peb.targetType.size,
+            'Peb',
+            'rw-'
+        ));
+    }
 }
 
 function HandleKernel() {
@@ -564,21 +606,31 @@ class _ChainEntry {
 
     toString() {
         const S = FormatPtr(this.Value) + ' (' + this.Name + ')';
-        if(!this.Last || this.AddrRegion == undefined) {
+        if(!this.Last) {
             return S;
         }
 
-        if(this.AddrRegion.Executable) {
+        //
+        // We only provide disassembly if we know that the code is executeable.
+        // And in order to know that, we need to have a valid `AddrRegion`.
+        //
+
+        if(this.AddrRegion != undefined && this.AddrRegion.Executable) {
             return Disassemble(this.Addr);
         }
 
-        if(this.AddrRegion.Readable) {
+        //
+        // If we have a string stored in a heap allocation what happens is the following:
+        //   - The extension does not know about heap, so `AddrRegion` for such a pointer
+        //   would be `undefined`.
+        //   - Even though it is undefined, we would like to display a string if there is any,
+        //   instead of just the first qword.
+        // So to enable the scenario to work, we allow to enter the below block with an `AddrRegion`
+        // that is undefined.
+        //
 
-            //
-            // Maybe it points on a unicode / ascii string?
-            //
+        if(this.AddrRegion == undefined || this.AddrRegion.Readable) {
 
-            const Ansi = ReadString(this.Addr);
             const IsPrintable = p => {
                 return p != null &&
                     // XXX: ugly AF.
@@ -586,13 +638,19 @@ class _ChainEntry {
                     p.length > 5
             };
 
+            //
+            // Maybe it points on a unicode / ascii string?
+            //
+
+            const Ansi = ReadString(this.Addr);
+
             if(IsPrintable(Ansi)) {
-                return Ansi;
+                return `${FormatPtr(this.Addr)} (Ascii(${FormatString(Ansi)}))`;
             }
 
             const Wide = ReadWideString(this.Addr);
             if(IsPrintable(Wide)) {
-                return Wide;
+                return  `${FormatPtr(this.Addr)} (Unicode(${FormatString(Wide)}))`;
             }
         }
 
